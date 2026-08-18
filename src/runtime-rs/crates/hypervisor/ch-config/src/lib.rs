@@ -542,6 +542,12 @@ pub struct NamedHypervisorConfig {
     pub network_devices: Option<Vec<NetConfig>>,
     pub host_devices: Option<Vec<DeviceConfig>>,
 
+    // Block devices that have to be cold-plugged, meaning they are added to
+    // the initial VmConfig rather than hot-plugged over the CH API once the
+    // VM is running (for example the initdata image, which the guest needs
+    // very early on in its boot).
+    pub boot_disks: Option<Vec<DiskConfig>>,
+
     // Set to the available guest protection *iff* BOTH of the following
     // conditions are true:
     //

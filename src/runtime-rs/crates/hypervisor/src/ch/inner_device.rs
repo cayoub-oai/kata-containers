@@ -53,29 +53,31 @@ impl CloudHypervisorInner {
             // If the VM is not running, add the device to the pending list to
             // be handled later.
             //
-            // Note that the only device types considered are DeviceType::ShareFs
-            // and DeviceType::Network since:
+            // Note that:
             //
             // - ShareFs (virtiofsd) is only needed in an non-DM and non-TDX scenario
             //   for the container rootfs.
             //
-            // - For all other scenarios, the container rootfs is handled by a
-            //   DeviceType::BlockModern and this method is called *after* the
-            //   VM has started so the device does not need to be added to the
-            //   pending list.
+            // - Network details need to be saved for later application.
+            //
+            // - A DeviceType::BlockModern requested before the VM is running
+            //   has to be cold-plugged, meaning it is turned into an entry of
+            //   VmConfig.disks (see 'convert.rs'). This is required for devices
+            //   the guest needs early on in its boot, such as the initdata
+            //   image. Container rootfs block devices are unaffected as they
+            //   are added *after* the VM has started and hence hot-plugged.
             //
             // - The VM rootfs is handled without waiting for calls to this
             //   method as the file in question (image= or initrd=) is available
             //   from HypervisorConfig.BootInfo.{image,initrd}
             //   (see 'convert.rs').
             //
-            // - Network details need to be saved for later application.
-            //
             match device {
                 DeviceType::ShareFs(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Network(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Vfio(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Protection(_) => self.pending_devices.insert(0, device.clone()),
+                DeviceType::BlockModern(_) => self.pending_devices.insert(0, device.clone()),
                 _ => {
                     debug!(
                         sl!(),
@@ -278,6 +280,40 @@ impl CloudHypervisorInner {
         Ok(DeviceType::HybridVsock(device))
     }
 
+    /// Build the cloud-hypervisor DiskConfig matching `config`, applying the
+    /// hypervisor-wide block device settings that are not part of the generic
+    /// block device configuration.
+    fn make_disk_config(&self, config: &BlockConfigModern) -> Result<DiskConfig> {
+        let mut disk_config = DiskConfig::try_from(config.clone())?;
+
+        disk_config.direct = config
+            .is_direct
+            .unwrap_or(self.config.blockdev_info.block_device_cache_direct);
+
+        disk_config.rate_limiter_config = RateLimiterConfig::new(
+            self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
+            self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
+            self.config
+                .blockdev_info
+                .disk_rate_limiter_bw_one_time_burst,
+            self.config
+                .blockdev_info
+                .disk_rate_limiter_ops_one_time_burst,
+        );
+
+        Ok(disk_config)
+    }
+
+    /// Returns true if `path` is the VM rootfs image or the initrd. Neither is
+    /// added as an extra disk: the image becomes the first VmConfig disk and
+    /// the initrd is part of the VmConfig payload (see 'convert.rs').
+    fn is_vm_boot_file(&self, path: &str) -> bool {
+        let boot_info = &self.config.boot_info;
+
+        (!boot_info.image.is_empty() && path == boot_info.image)
+            || (!boot_info.initrd.is_empty() && path == boot_info.initrd)
+    }
+
     async fn handle_block_device(
         &mut self,
         device: Arc<Mutex<BlockDeviceModern>>,
@@ -288,22 +324,7 @@ impl CloudHypervisorInner {
             (dev.device_id.clone(), dev.config.clone())
         };
 
-        let mut disk_config = DiskConfig::try_from(config.clone())?;
-        disk_config.direct = config
-            .is_direct
-            .unwrap_or(self.config.blockdev_info.block_device_cache_direct);
-
-        let block_rate_limit = RateLimiterConfig::new(
-            self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
-            self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
-            self.config
-                .blockdev_info
-                .disk_rate_limiter_bw_one_time_burst,
-            self.config
-                .blockdev_info
-                .disk_rate_limiter_ops_one_time_burst,
-        );
-        disk_config.rate_limiter_config = block_rate_limit;
+        let disk_config = self.make_disk_config(&config)?;
 
         let response = cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await?;
 
@@ -334,8 +355,11 @@ impl CloudHypervisorInner {
         // Convert pairs into the actual queue count.
         clh_net_config.num_queues = netdev.config.queue_num.max(1) * 2;
 
-        let files = open_named_tuntap(&netdev.config.host_dev_name, netdev.config.queue_num.max(1) as u32)
-            .context("open named tuntap")?;
+        let files = open_named_tuntap(
+            &netdev.config.host_dev_name,
+            netdev.config.queue_num.max(1) as u32,
+        )
+        .context("open named tuntap")?;
 
         let fds = files.iter().map(|f| f.as_raw_fd()).collect();
 
@@ -356,11 +380,13 @@ impl CloudHypervisorInner {
         Option<Vec<NetConfig>>,
         Option<Vec<DeviceConfig>>,
         Option<ProtectionDevConfig>,
+        Option<Vec<DiskConfig>>,
     )> {
         let mut shared_fs_devices = Vec::<FsConfig>::new();
         let mut network_devices = Vec::<NetConfig>::new();
         let mut host_devices = Vec::<DeviceConfig>::new();
         let mut protection_device = ProtectionDevConfig::default();
+        let mut boot_disks = Vec::<DiskConfig>::new();
 
         while let Some(dev) = self.pending_devices.pop() {
             match dev {
@@ -479,6 +505,18 @@ impl CloudHypervisorInner {
                         _ => info!(sl!(), "CH: unsupported protection device type"),
                     }
                 }
+                DeviceType::BlockModern(block_device) => {
+                    let config = block_device.lock().await.config.clone();
+
+                    if self.is_vm_boot_file(&config.path_on_host) {
+                        // Already handled through the VmConfig payload/disks.
+                        continue;
+                    }
+
+                    info!(sl!(), "cold-plugging block device {:?}", &config);
+
+                    boot_disks.push(self.make_disk_config(&config)?);
+                }
                 _ => continue,
             }
         }
@@ -488,6 +526,7 @@ impl CloudHypervisorInner {
             Some(network_devices),
             Some(host_devices),
             Some(protection_device),
+            Some(boot_disks),
         ))
     }
 }
